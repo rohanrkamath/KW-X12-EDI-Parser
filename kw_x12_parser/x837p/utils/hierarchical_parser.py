@@ -152,25 +152,88 @@ def _parse_837p_from_segments(segments: list) -> Parsed837P:
     remaining = txn_segments[hl_start:]
     nodes = _build_hl_nodes(remaining)
 
-    # Build hierarchy: level 20 = BillingProvider, level 22 = SubscriberClaim
+    # Build hierarchy. Billing providers = HL level 20. Claims are detected by the
+    # presence of CLM segments in a node, regardless of HL level (subscriber level
+    # 22 or patient/dependent level 23), and attached to their billing-provider
+    # ancestor by walking the parent chain. A node may hold multiple CLM loops.
     billing_providers: list[BillingProvider] = []
     bp_by_id: dict[str, BillingProvider] = {}
+    node_by_id: dict[str, tuple[HLNode, list]] = {n.hl_id: (n, segs) for n, segs in nodes}
 
+    def _billing_ancestor_id(node: HLNode) -> str | None:
+        cur: HLNode | None = node
+        seen: set[str] = set()
+        while cur is not None and cur.hl_id not in seen:
+            seen.add(cur.hl_id)
+            if cur.level_code == "20":
+                return cur.hl_id
+            if not cur.parent_id:
+                return None
+            nxt = node_by_id.get(cur.parent_id)
+            cur = nxt[0] if nxt else None
+        return None
+
+    def _subscriber_context(node: HLNode) -> list:
+        """Ancestor segments between a claim node and its billing provider (e.g. the
+        subscriber SBR/NM1*IL/NM1*PR needed by a dependent claim), in top-down order."""
+        chain: list[HLNode] = []
+        pid = node.parent_id
+        seen: set[str] = set()
+        while pid and pid in node_by_id and pid not in seen:
+            seen.add(pid)
+            anc, _anc_segs = node_by_id[pid]
+            if anc.level_code == "20":
+                break
+            chain.append(anc)
+            pid = anc.parent_id
+        ctx: list = []
+        for anc in reversed(chain):
+            ctx.extend(node_by_id[anc.hl_id][1])
+        return ctx
+
+    def _claim_groups(node_segments: list) -> tuple[list, list[list]]:
+        """Split a node's segments into (pre-CLM shared segments, [per-CLM group])."""
+        shared: list = []
+        groups: list[list] = []
+        current: list | None = None
+        for s in node_segments:
+            if s.id == "CLM":
+                if current is not None:
+                    groups.append(current)
+                current = [s]
+            elif current is not None:
+                current.append(s)
+            else:
+                shared.append(s)
+        if current is not None:
+            groups.append(current)
+        return shared, groups
+
+    # Pass 1: billing providers.
     for node, node_segments in nodes:
         if node.level_code == "20":
             bp = BillingProvider(hl_node=node, segments=node_segments)
             billing_providers.append(bp)
             bp_by_id[node.hl_id] = bp
-        elif node.level_code == "22" and node.parent_id:
-            parent_bp = bp_by_id.get(node.parent_id)
-            if parent_bp:
-                header_segs, line_groups = _split_service_lines(node_segments)
-                claim = SubscriberClaim(
-                    hl_node=node,
-                    segments=header_segs,
-                    service_lines=[ServiceLine(segments=g) for g in line_groups],
-                )
-                parent_bp.claims.append(claim)
+
+    # Pass 2: claims (any HL level that contains CLM segments).
+    for node, node_segments in nodes:
+        node_shared, groups = _claim_groups(node_segments)
+        if not groups:
+            continue  # pure-hierarchy node (e.g. a subscriber whose claims live on a dependent)
+        bp_id = _billing_ancestor_id(node)
+        parent_bp = bp_by_id.get(bp_id) if bp_id else None
+        if parent_bp is None:
+            continue
+        ctx = _subscriber_context(node)
+        for group in groups:
+            header_segs, line_groups = _split_service_lines(group)
+            claim = SubscriberClaim(
+                hl_node=node,
+                segments=ctx + node_shared + header_segs,
+                service_lines=[ServiceLine(segments=g) for g in line_groups],
+            )
+            parent_bp.claims.append(claim)
 
     # Extract envelope segments (ISA, GS, GE, IEA, SE) from full segment list
     isa_seg = next((_parse_segment_from_parsed(s) for s in segments if s.id == "ISA"), None)

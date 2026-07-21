@@ -148,7 +148,15 @@ class SubscriberClaim:
 
     @property
     def patient_name(self) -> str | None:
-        # In Medicare, subscriber = patient; NM1*IL appears for subscriber
+        # Dependent claims carry the patient as NM1*QC (Loop 2010CA); subscriber-is-
+        # patient claims (Medicare, etc.) only have NM1*IL. Prefer QC when present.
+        for s in self.segments:
+            if s.id == "NM1" and s.get(1) == "QC":  # Patient (NM101)
+                last = s.get(3) or ""   # NM103
+                first = s.get(4) or ""  # NM104
+                name = f"{first} {last}".strip()
+                if name:
+                    return name
         return self.subscriber_name
 
     @property

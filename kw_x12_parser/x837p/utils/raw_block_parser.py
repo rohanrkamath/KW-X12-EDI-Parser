@@ -1,6 +1,28 @@
 """
 837P full-fidelity parser: preserves every segment and loop for repackaging.
-Supports hold/release: parse -> process -> repackage EDI minus held claims.
+
+Supports hold/release at the individual claim (CLM loop) level: parse -> filter
+-> repackage EDI keeping only the requested claims, while preserving the shared
+billing-provider / subscriber / patient HL hierarchy and producing structurally
+valid envelopes (ST/SE, GS/GE, ISA/IEA).
+
+Design
+------
+The interchange is modelled as a real tree so filtering happens per CLM loop,
+not per HL block:
+
+    Interchange (ISA/IEA)
+      RawGroup (GS/GE)
+        RawTransaction (ST/SE)
+          header_segments        # ST, BHT, Loop 1000A/1000B (before first HL)
+          RawHLBlock*            # one per HL
+            shared_segments      # HL + everything before the first CLM
+            RawClaimLoop*        # one per CLM (CLM .. next CLM/HL/SE)
+
+Claims are detected by the presence of CLM segments (not by HL03 == "22"), so a
+claim under a patient/dependent HL is handled correctly. Every CLM occurrence is
+retained independently, so duplicate CLM01 values are all preserved (see
+``filter`` semantics below).
 """
 
 from __future__ import annotations
@@ -18,8 +40,31 @@ from .claim_models import (
 )
 
 
+# --------------------------------------------------------------------------- #
+# Small raw-segment helpers (delimiter-driven, never hardcoded)
+# --------------------------------------------------------------------------- #
+def _seg_id(raw_seg: str, elem_sep: str) -> str:
+    """Return the segment ID (first element) of a raw segment string."""
+    return raw_seg.split(elem_sep, 1)[0].strip()
+
+
+def _seg_elem(raw_seg: str, idx: int, elem_sep: str) -> str:
+    """Return element ``idx`` (0-based) of a raw segment, or '' if absent."""
+    parts = raw_seg.split(elem_sep)
+    return parts[idx].strip() if 0 <= idx < len(parts) else ""
+
+
+def _set_seg_elem(raw_seg: str, idx: int, value: str, elem_sep: str) -> str:
+    """Return raw_seg with element ``idx`` (0-based) set to ``value`` (padding if needed)."""
+    parts = raw_seg.split(elem_sep)
+    while len(parts) <= idx:
+        parts.append("")
+    parts[idx] = value
+    return elem_sep.join(parts)
+
+
 def _extract_claim_id_from_raw(raw: str, elem_sep: str, seg_term: str) -> str | None:
-    """Extract CLM01 from raw block content."""
+    """Extract the first CLM01 from raw block content (kept for backward compat)."""
     for raw_seg in raw.split(seg_term):
         raw_seg = raw_seg.strip()
         if not raw_seg:
@@ -30,10 +75,10 @@ def _extract_claim_id_from_raw(raw: str, elem_sep: str, seg_term: str) -> str | 
     return None
 
 
-def _extract_claim_ids_from_segment_list(segments: list[str], elem_sep: str) -> list[str]:
-    """Collect CLM01 from a list of raw segment strings (one segment per element)."""
+def _extract_all_clm_ids(text: str, elem_sep: str, seg_term: str) -> list[str]:
+    """Collect every CLM01 (in order, with duplicates) from an EDI string."""
     ids: list[str] = []
-    for raw_seg in segments:
+    for raw_seg in text.split(seg_term):
         raw_seg = raw_seg.strip()
         if not raw_seg:
             continue
@@ -43,79 +88,117 @@ def _extract_claim_ids_from_segment_list(segments: list[str], elem_sep: str) -> 
     return ids
 
 
-def _pair_st837_se_indices(raw_list: list[str]) -> list[tuple[int, int]]:
-    """
-    Pair each ST*837* start index with its closing SE index within the same group.
-    Returns [] if there is at most one 837 transaction set (caller uses single-ST path).
-    """
-    st_indices = [i for i, r in enumerate(raw_list) if r.startswith("ST*837")]
-    if len(st_indices) <= 1:
-        return []
-    pairs: list[tuple[int, int]] = []
-    for k, st_i in enumerate(st_indices):
-        end_limit = st_indices[k + 1] if k + 1 < len(st_indices) else len(raw_list)
-        se_k: int | None = None
-        for j in range(st_i + 1, end_limit):
-            if raw_list[j].startswith("SE"):
-                se_k = j
-                break
-        if se_k is None:
-            for j in range(st_i + 1, len(raw_list)):
-                if raw_list[j].startswith("SE"):
-                    se_k = j
-                    break
-        if se_k is not None:
-            pairs.append((st_i, se_k))
-    return pairs
+# --------------------------------------------------------------------------- #
+# Raw structural model
+# --------------------------------------------------------------------------- #
+@dataclass
+class RawClaimLoop:
+    """A single claim loop: the CLM segment and everything up to the next
+    CLM / HL / transaction trailer."""
+
+    claim_id: str
+    segments: list[str] = field(default_factory=list)  # raw segment strings, CLM first
 
 
 @dataclass
-class EdiBlock:
-    """One HL block (billing provider or claim) with full raw EDI content."""
+class RawHLBlock:
+    """One HL block. ``shared_segments`` is the HL segment plus every segment
+    before the first CLM (subscriber/patient/provider level content). Individual
+    claims live in ``claim_loops``."""
 
     hl_id: str
     parent_id: str | None
-    level_code: str  # 20 = billing provider, 22 = claim
-    raw_content: str  # HL + all segments until next HL (no trailing terminator)
-    claim_id: str | None = None  # From CLM01 if level 22
+    level_code: str            # HL03
+    child_code: str            # HL04 (original)
+    shared_segments: list[str] = field(default_factory=list)
+    claim_loops: list[RawClaimLoop] = field(default_factory=list)
+
+    @property
+    def claim_ids(self) -> list[str]:
+        return [c.claim_id for c in self.claim_loops]
+
+
+@dataclass
+class RawTransaction:
+    """One ST*837 ... SE transaction set."""
+
+    header_segments: list[str] = field(default_factory=list)  # ST .. before first HL
+    hl_blocks: list[RawHLBlock] = field(default_factory=list)
+    se_segment: str = ""
+
+
+@dataclass
+class RawGroup:
+    """One GS ... GE functional group."""
+
+    gs_segment: str = ""
+    transactions: list[RawTransaction] = field(default_factory=list)
+    ge_segment: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Backward-compat block model (still populated for external/debug use)
+# --------------------------------------------------------------------------- #
+@dataclass
+class EdiBlock:
+    """One HL block with full raw EDI content. Retained for backward
+    compatibility; claim-level filtering now uses the RawHLBlock model."""
+
+    hl_id: str
+    parent_id: str | None
+    level_code: str
+    raw_content: str
+    claim_id: str | None = None  # first CLM01 in the block, if any
+
+
+class ClaimFilterError(ValueError):
+    """Raised when requested claims cannot be satisfied or the rebuilt EDI is invalid."""
 
 
 @dataclass
 class Parsed837PFull(Parsed837P):
     """
-    Full-fidelity 837P parse: every segment and loop preserved.
-    Use to_edi_string(exclude_claim_ids) or write_edi() to repackage minus held claims.
+    Full-fidelity 837P parse: every segment and loop preserved, structured as a
+    real interchange tree so claims can be filtered individually.
     """
 
-    delimiters: Delimiters = field(default_factory=lambda: Delimiters("*", ":", "~"))  # Set from parse
+    delimiters: Delimiters = field(default_factory=lambda: Delimiters("*", ":", "~"))
     raw_isa: str = ""
+    raw_iea: str = ""
+    groups: list[RawGroup] = field(default_factory=list)
+
+    # Backward-compat flat fields (first occurrence / best effort)
     raw_gs: str = ""
-    raw_header: str = ""  # ST, BHT, Loop 1000A, 1000B - before first HL
+    raw_header: str = ""
     raw_blocks: list[EdiBlock] = field(default_factory=list)
     raw_se: str = ""
     raw_ge: str = ""
-    raw_iea: str = ""
-
-    # Map claim_id -> index in raw_blocks (for filtering)
-    _claim_id_to_block_idx: dict[str, int] = field(default_factory=dict, repr=False)
 
     # Every segment in the file (ISA through IEA) in document order
     complete_segments: list[Segment] = field(default_factory=list, repr=False)
-
-    # Raw segment strings in order (from parse_string); used for multi-ST*837* repackaging
+    # Raw segment strings in order (from parse_string)
     raw_segment_list: list[str] = field(default_factory=list, repr=False)
 
+    # --------------------------------------------------------------------- #
+    # Introspection
+    # --------------------------------------------------------------------- #
     def iter_every_segment(self):
         """Yield every segment in the file (ISA through IEA) in document order."""
         for seg in self.complete_segments:
             yield seg
 
     def get_all_claim_ids(self) -> list[str]:
-        """Return all claim IDs in order (for hold/release logic)."""
-        return [b.claim_id for b in self.raw_blocks if b.claim_id is not None]
+        """Return every claim ID in source order (duplicates preserved)."""
+        return [
+            c.claim_id
+            for g in self.groups
+            for txn in g.transactions
+            for hl in txn.hl_blocks
+            for c in hl.claim_loops
+        ]
 
     def get_claim_by_id(self, claim_id: str) -> SubscriberClaim | None:
-        """Get SubscriberClaim for a given claim_id."""
+        """Get the first SubscriberClaim for a given claim_id (from base parse)."""
         for bp in self.billing_providers:
             for c in bp.claims:
                 if c.claim_id == claim_id:
@@ -123,7 +206,7 @@ class Parsed837PFull(Parsed837P):
         return None
 
     def iter_all_segments_per_claim(self):
-        """Yield (claim_id, segment) for every segment in every claim."""
+        """Yield (claim_id, segment) for every segment in every claim (base parse)."""
         for bp in self.billing_providers:
             for claim in bp.claims:
                 for seg in claim.segments:
@@ -132,74 +215,81 @@ class Parsed837PFull(Parsed837P):
                     for seg in sl.segments:
                         yield claim.claim_id, seg
 
-    def _to_edi_string_multi_gs_st837(
+    # --------------------------------------------------------------------- #
+    # Reconstruction / filtering
+    # --------------------------------------------------------------------- #
+    def _rebuild_transaction(
         self,
-        st_se_pairs: list[tuple[int, int]],
-        *,
-        exclude: set[str],
-        include: set[str] | None,
-        include_fn: Callable[[str], bool] | None,
-        isa15_usage_indicator: str | None,
-    ) -> str:
+        txn: RawTransaction,
+        keep: Callable[[str], bool],
+    ) -> str | None:
         """
-        One GS group contains multiple ST*837* ... SE transaction sets.
-        Emit ISA, GS, then each included ST..SE verbatim, then GE (GE01 = output txn count), IEA.
+        Rebuild one ST..SE transaction keeping only claim loops for which
+        ``keep(claim_id)`` is True, plus the ancestor HL hierarchy required by
+        those claims. Returns the transaction string, or None if it retains no
+        claims.
         """
-        t = self.delimiters.segment_term
         e = self.delimiters.element
-        raw_list = self.raw_segment_list
-        if not raw_list:
-            raise ValueError("Multi-ST repackaging requires raw_segment_list from parse_837p_full()")
+        t = self.delimiters.segment_term
 
-        def claim_id_included(cid: str) -> bool:
-            if cid in exclude:
-                return False
-            if include is not None and cid not in include:
-                return False
-            if include_fn is not None and not include_fn(cid):
-                return False
-            return True
+        hl_by_id: dict[str, RawHLBlock] = {hl.hl_id: hl for hl in txn.hl_blocks}
 
-        def txn_included(st_i: int, se_i: int) -> bool:
-            segs = raw_list[st_i : se_i + 1]
-            cids = _extract_claim_ids_from_segment_list(segs, e)
-            if not cids:
-                return True
-            return any(claim_id_included(c) for c in cids)
+        # 1. Retained claim loops per HL (source order preserved).
+        retained_loops: dict[str, list[RawClaimLoop]] = {}
+        directly_retained: set[str] = set()
+        for hl in txn.hl_blocks:
+            kept = [c for c in hl.claim_loops if keep(c.claim_id)]
+            retained_loops[hl.hl_id] = kept
+            if kept:
+                directly_retained.add(hl.hl_id)
 
-        raw_isa = self.raw_isa
-        if isa15_usage_indicator is not None:
-            parts_isa = raw_isa.split(e)
-            if len(parts_isa) >= 16:
-                parts_isa[15] = isa15_usage_indicator
-                raw_isa = e.join(parts_isa)
+        if not directly_retained:
+            return None
 
-        parts_out: list[str] = [raw_isa, self.raw_gs]
+        # 2. Walk parent chains to retain every required ancestor HL.
+        retained_hls: set[str] = set(directly_retained)
+        for hid in list(directly_retained):
+            cur: RawHLBlock | None = hl_by_id.get(hid)
+            while cur is not None and cur.parent_id and cur.parent_id in hl_by_id:
+                pid = cur.parent_id
+                already = pid in retained_hls
+                retained_hls.add(pid)
+                if already:
+                    break  # this ancestor's chain was already retained
+                cur = hl_by_id.get(pid)
 
-        n_txn = 0
-        for st_i, se_i in st_se_pairs:
-            if txn_included(st_i, se_i):
-                parts_out.append(t.join(raw_list[st_i : se_i + 1]))
-                n_txn += 1
+        ordered = [hl for hl in txn.hl_blocks if hl.hl_id in retained_hls]
 
-        if n_txn == 0:
-            raise ValueError("No transaction sets left after claim filtering; cannot build EDI.")
+        # 3. Sequential HL renumbering (original order) + parent remap.
+        old_to_new = {hl.hl_id: str(i) for i, hl in enumerate(ordered, start=1)}
 
-        ge_raw = self.raw_ge
-        if ge_raw:
-            ge_parts = ge_raw.split(e)
-            if ge_parts and ge_parts[0].strip() == "GE" and len(ge_parts) >= 2:
-                ge_parts[1] = str(n_txn)
-                parts_out.append(e.join(ge_parts))
-            else:
-                parts_out.append(ge_raw)
-        else:
-            parts_out.append("")
+        # 4. HL04 child indicator: does any retained HL still reference this HL as parent?
+        parents_with_children: set[str] = {
+            hl.parent_id
+            for hl in ordered
+            if hl.parent_id and hl.parent_id in retained_hls
+        }
 
-        if self.raw_iea:
-            parts_out.append(self.raw_iea)
+        body: list[str] = []
+        for hl in ordered:
+            hl_seg = hl.shared_segments[0]
+            hl_seg = _set_seg_elem(hl_seg, 1, old_to_new[hl.hl_id], e)  # HL01
+            new_parent = old_to_new.get(hl.parent_id, "") if hl.parent_id else ""
+            hl_seg = _set_seg_elem(hl_seg, 2, new_parent, e)           # HL02
+            hl_seg = _set_seg_elem(
+                hl_seg, 4, "1" if hl.hl_id in parents_with_children else "0", e
+            )  # HL04
+            body.append(hl_seg)
+            body.extend(hl.shared_segments[1:])
+            for loop in retained_loops[hl.hl_id]:
+                body.extend(loop.segments)
 
-        return t.join(parts_out)
+        # 5. Recalculate SE01 = number of segments from ST through SE inclusive.
+        seg_list = list(txn.header_segments) + body + [txn.se_segment]
+        se_seg = _set_seg_elem(txn.se_segment, 1, str(len(seg_list)), e)  # SE01
+        seg_list[-1] = se_seg  # SE02 preserved (== ST02)
+
+        return t.join(seg_list)
 
     def to_edi_string(
         self,
@@ -210,122 +300,126 @@ class Parsed837PFull(Parsed837P):
         isa15_usage_indicator: str | None = None,
     ) -> str:
         """
-        Repackage EDI string, optionally excluding held claims.
+        Repackage the EDI, filtering at the individual claim (CLM loop) level.
 
         Args:
             exclude_claim_ids: Claim IDs to omit (held claims).
-            include_claim_ids: If set, only include these claim IDs (released claims).
-            include_claim_ids_fn: Callable(claim_id) -> bool; if provided, include claim when True.
+            include_claim_ids: If set, only these claim IDs are emitted (released claims).
+                Every requested ID must exist in the source or ClaimFilterError is raised.
+            include_claim_ids_fn: Callable(claim_id) -> bool; claim kept only when True.
             isa15_usage_indicator: Optional ISA15 override ("T" test / "P" production).
 
+        Precedence (a claim is emitted only if all provided filters agree):
+            not in exclude AND (include is None or in include) AND (fn is None or fn(id)).
+
+        Duplicate CLM01: every occurrence matching the filters is retained.
+
         Returns:
-            Valid 837P EDI string (minus excluded claims).
+            Valid 837P EDI string containing exactly the retained claims.
+
+        Raises:
+            ClaimFilterError: requested include IDs missing from source, no claims
+                retained, or the rebuilt EDI fails output validation.
         """
+        e = self.delimiters.element
+        t = self.delimiters.segment_term
         exclude = exclude_claim_ids or set()
         include = include_claim_ids
         fn = include_claim_ids_fn
 
-        multi_pairs = _pair_st837_se_indices(self.raw_segment_list)
-        if len(multi_pairs) > 1:
-            return self._to_edi_string_multi_gs_st837(
-                multi_pairs,
-                exclude=exclude,
-                include=include,
-                include_fn=fn,
-                isa15_usage_indicator=isa15_usage_indicator,
-            )
-
-        def claim_included(block: EdiBlock) -> bool:
-            if block.claim_id is None:
+        def keep(cid: str) -> bool:
+            if cid in exclude:
                 return False
-            if block.claim_id in exclude:
+            if include is not None and cid not in include:
                 return False
-            if include is not None and block.claim_id not in include:
-                return False
-            if fn is not None and not fn(block.claim_id):
+            if fn is not None and not fn(cid):
                 return False
             return True
 
-        def provider_has_included_claims(hl_id: str) -> bool:
-            return any(
-                claim_included(b) for b in self.raw_blocks
-                if b.parent_id == hl_id and b.claim_id is not None
+        # Source claim IDs (order + duplicates preserved) and validation of requests.
+        source_ids = self.get_all_claim_ids()
+        source_set = set(source_ids)
+        if include is not None:
+            missing = sorted(cid for cid in include if cid not in source_set)
+            if missing:
+                raise ClaimFilterError(
+                    "Requested claim IDs not found in source EDI: " + ", ".join(missing)
+                )
+
+        expected = [cid for cid in source_ids if keep(cid)]
+        if not expected:
+            raise ClaimFilterError(
+                "No claims retained after filtering; refusing to write empty/header-only EDI."
             )
 
-        def should_include_block(block: EdiBlock) -> bool:
-            if block.claim_id is None:
-                return provider_has_included_claims(block.hl_id)
-            return claim_included(block)
-
-        def _renumber_hl_blocks(blocks: list[EdiBlock]) -> list[EdiBlock]:
-            """
-            Renumber HL01 sequentially and remap HL02 parent references for included blocks.
-            This keeps Loop 2000 HL hierarchy valid after claim filtering.
-            """
-            e = self.delimiters.element
-            old_to_new: dict[str, str] = {}
-
-            # First pass: assign new sequential HL IDs in output order.
-            for idx, b in enumerate(blocks, start=1):
-                old_to_new[b.hl_id] = str(idx)
-
-            remapped: list[EdiBlock] = []
-            for b in blocks:
-                segs = [s for s in b.raw_content.split(t) if s.strip()]
-                if not segs:
-                    remapped.append(b)
-                    continue
-
-                hl_parts = segs[0].split(e)
-                if len(hl_parts) >= 2:
-                    hl_parts[1] = old_to_new.get(b.hl_id, hl_parts[1])
-                if len(hl_parts) >= 3:
-                    old_parent = hl_parts[2].strip()
-                    if old_parent:
-                        hl_parts[2] = old_to_new.get(old_parent, hl_parts[2])
-                    else:
-                        hl_parts[2] = ""
-                segs[0] = e.join(hl_parts)
-
-                remapped.append(
-                    EdiBlock(
-                        hl_id=old_to_new.get(b.hl_id, b.hl_id),
-                        parent_id=old_to_new.get(b.parent_id, b.parent_id) if b.parent_id else None,
-                        level_code=b.level_code,
-                        raw_content=t.join(segs),
-                        claim_id=b.claim_id,
-                    )
-                )
-            return remapped
-
-        t = self.delimiters.segment_term
+        # Rebuild envelope: ISA, groups (GS, retained ST..SE, GE), IEA.
         raw_isa = self.raw_isa
         if isa15_usage_indicator is not None:
-            parts = raw_isa.split(self.delimiters.element)
-            if len(parts) >= 16:
-                parts[15] = isa15_usage_indicator
-                raw_isa = self.delimiters.element.join(parts)
-        parts: list[str] = [raw_isa, self.raw_gs, self.raw_header]
+            raw_isa = _set_seg_elem(raw_isa, 15, isa15_usage_indicator, e)  # ISA15
 
-        included_blocks = [b for b in self.raw_blocks if should_include_block(b)]
-        included_blocks = _renumber_hl_blocks(included_blocks)
-        for block in included_blocks:
-            parts.append(block.raw_content)
+        parts: list[str] = [raw_isa]
+        retained_group_count = 0
+        for g in self.groups:
+            rebuilt_txns = [
+                s for s in (self._rebuild_transaction(txn, keep) for txn in g.transactions)
+                if s is not None
+            ]
+            if not rebuilt_txns:
+                continue
+            retained_group_count += 1
+            parts.append(g.gs_segment)
+            parts.extend(rebuilt_txns)
+            ge_seg = g.ge_segment
+            if ge_seg:
+                ge_seg = _set_seg_elem(ge_seg, 1, str(len(rebuilt_txns)), e)  # GE01
+            parts.append(ge_seg)
 
-        # Recalculate SE01 (segment count)
-        header_count = len([s for s in self.raw_header.split(t) if s.strip()])
-        block_count = sum(len([s for s in b.raw_content.split(t) if s.strip()]) for b in included_blocks)
-        total_seg_count = header_count + block_count + 1  # +1 for SE
-        se_parts = self.raw_se.split(self.delimiters.element)
-        if len(se_parts) >= 2:
-            se_parts[1] = str(total_seg_count)
-            parts.append(self.delimiters.element.join(se_parts))
-        else:
-            parts.append(self.raw_se)
+        if retained_group_count == 0:
+            raise ClaimFilterError("No transaction sets retained after filtering.")
 
-        parts.extend([self.raw_ge, self.raw_iea])
-        return t.join(parts)
+        iea_seg = self.raw_iea
+        if iea_seg:
+            iea_seg = _set_seg_elem(iea_seg, 1, str(retained_group_count), e)  # IEA01
+        parts.append(iea_seg)
 
+        result = t.join(p for p in parts if p != "")
+
+        self._validate_output(result, expected, include, e, t)
+        return result
+
+    def _validate_output(
+        self,
+        result: str,
+        expected: list[str],
+        include: set[str] | None,
+        elem_sep: str,
+        seg_term: str,
+    ) -> None:
+        """Guarantee the rebuilt EDI contains exactly the expected claims and reparses."""
+        out_ids = _extract_all_clm_ids(result, elem_sep, seg_term)
+        if out_ids != expected:
+            raise ClaimFilterError(
+                "Output claim validation failed: "
+                f"expected {expected}, got {out_ids}"
+            )
+        if include is not None:
+            unrequested = sorted({c for c in out_ids if c not in include})
+            if unrequested:
+                raise ClaimFilterError(
+                    "Output contains unrequested claims: " + ", ".join(unrequested)
+                )
+        try:
+            reparsed = parse_string(result)
+        except Exception as ex:  # pragma: no cover - defensive
+            raise ClaimFilterError(f"Rebuilt EDI failed to reparse: {ex}") from ex
+        reparsed_ids = _extract_all_clm_ids(
+            seg_term.join(reparsed.raw_segments), elem_sep, seg_term
+        )
+        if reparsed_ids != expected:
+            raise ClaimFilterError(
+                "Reparsed EDI claim set mismatch: "
+                f"expected {expected}, got {reparsed_ids}"
+            )
 
     def write_edi(
         self,
@@ -336,7 +430,11 @@ class Parsed837PFull(Parsed837P):
         include_claim_ids_fn: Callable[[str], bool] | None = None,
         isa15_usage_indicator: str | None = None,
     ) -> None:
-        """Write repackaged EDI to file. See to_edi_string() for args."""
+        """Write repackaged EDI to file. See to_edi_string() for args and errors.
+
+        The file is only written after all validation passes, so an incomplete or
+        empty EDI is never produced.
+        """
         content = self.to_edi_string(
             exclude_claim_ids=exclude_claim_ids,
             include_claim_ids=include_claim_ids,
@@ -346,13 +444,94 @@ class Parsed837PFull(Parsed837P):
         Path(path).write_text(content, encoding="utf-8")
 
 
+# --------------------------------------------------------------------------- #
+# Parsing
+# --------------------------------------------------------------------------- #
+def _build_raw_tree(
+    raw_list: list[str], elem_sep: str
+) -> tuple[str, list[RawGroup], str]:
+    """Split the raw segment list into (ISA, [RawGroup], IEA) with per-claim loops."""
+    raw_isa = ""
+    raw_iea = ""
+    groups: list[RawGroup] = []
+
+    cur_group: RawGroup | None = None
+    cur_txn: RawTransaction | None = None
+    cur_hl: RawHLBlock | None = None
+    cur_claim: RawClaimLoop | None = None
+
+    for raw in raw_list:
+        sid = _seg_id(raw, elem_sep)
+
+        if sid == "ISA":
+            raw_isa = raw
+        elif sid == "IEA":
+            raw_iea = raw
+            cur_group = cur_txn = cur_hl = cur_claim = None
+        elif sid == "GS":
+            cur_group = RawGroup(gs_segment=raw)
+            groups.append(cur_group)
+            cur_txn = cur_hl = cur_claim = None
+        elif sid == "GE":
+            if cur_group is not None:
+                cur_group.ge_segment = raw
+            cur_group = cur_txn = cur_hl = cur_claim = None
+        elif sid == "ST":
+            cur_txn = RawTransaction(header_segments=[raw])
+            if cur_group is not None:
+                cur_group.transactions.append(cur_txn)
+            cur_hl = cur_claim = None
+        elif sid == "SE":
+            if cur_txn is not None:
+                cur_txn.se_segment = raw
+            cur_txn = cur_hl = cur_claim = None
+        elif sid == "HL":
+            parts = raw.split(elem_sep)
+            hl_id = parts[1].strip() if len(parts) > 1 else ""
+            parent_id = parts[2].strip() if len(parts) > 2 else ""
+            level_code = parts[3].strip() if len(parts) > 3 else ""
+            child_code = parts[4].strip() if len(parts) > 4 else ""
+            cur_hl = RawHLBlock(
+                hl_id=hl_id,
+                parent_id=parent_id or None,
+                level_code=level_code,
+                child_code=child_code,
+                shared_segments=[raw],
+            )
+            cur_claim = None
+            if cur_txn is not None:
+                cur_txn.hl_blocks.append(cur_hl)
+        elif sid == "CLM":
+            parts = raw.split(elem_sep)
+            claim_id = parts[1].strip() if len(parts) > 1 else ""
+            cur_claim = RawClaimLoop(claim_id=claim_id, segments=[raw])
+            if cur_hl is not None:
+                cur_hl.claim_loops.append(cur_claim)
+            elif cur_txn is not None:
+                # CLM before any HL (non-conforming) -> keep in header to avoid loss
+                cur_txn.header_segments.append(raw)
+                cur_claim = None
+        else:
+            if cur_claim is not None:
+                cur_claim.segments.append(raw)
+            elif cur_hl is not None:
+                cur_hl.shared_segments.append(raw)
+            elif cur_txn is not None:
+                cur_txn.header_segments.append(raw)
+            # else: stray segment outside any transaction -> ignore
+
+    return raw_isa, groups, raw_iea
+
+
 def parse_837p_full(
     content: str | None = None,
     file_path: str | Path | None = None,
 ) -> Parsed837PFull:
     """
     Parse 837P with full preservation for repackaging.
-    Use to_edi_string(exclude_claim_ids=held) or write_edi() to rebuild EDI minus held claims.
+
+    Use ``to_edi_string(include_claim_ids=...)`` / ``write_edi(...)`` to rebuild
+    the EDI containing only the requested claims (filtered at the CLM-loop level).
     """
     if content is None and file_path is None:
         raise ValueError("Provide content or file_path")
@@ -360,6 +539,7 @@ def parse_837p_full(
         raise ValueError("Provide either content or file_path, not both")
     if file_path is not None:
         content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+
     base = parse_string(content)
     result = _parse_837p_from_segments(base.segments)
     full = Parsed837PFull(
@@ -370,74 +550,44 @@ def parse_837p_full(
         all_segments=result.all_segments,
     )
     full.delimiters = base.delimiters
-
-    # Store every segment (ISA through IEA) for full access
     full.complete_segments = [
         Segment(id=s.id, elements=list(s.elements)) for s in base.segments
     ]
 
+    e = base.delimiters.element
     t = base.delimiters.segment_term
     raw_list = base.raw_segments
-
-    # Find indices
-    isa_idx = next((i for i, r in enumerate(raw_list) if r.startswith("ISA")), 0)
-    gs_idx = next((i for i, r in enumerate(raw_list) if r.startswith("GS")), 1)
-    st_idx = next((i for i, r in enumerate(raw_list) if r.startswith("ST")), 2)
-    hl_indices = [i for i, r in enumerate(raw_list) if r.startswith("HL")]
-    se_idx = next((i for i, r in enumerate(raw_list) if r.startswith("SE")), -1)
-    ge_idx = next((i for i, r in enumerate(raw_list) if r.startswith("GE")), -1)
-    iea_idx = next((i for i, r in enumerate(raw_list) if r.startswith("IEA")), -1)
-
-    full.raw_isa = raw_list[isa_idx] if isa_idx < len(raw_list) else ""
-    full.raw_gs = raw_list[gs_idx] if gs_idx < len(raw_list) else ""
-
-    first_hl = hl_indices[0] if hl_indices else len(raw_list)
-    header_raws = raw_list[st_idx:first_hl]
-    full.raw_header = t.join(header_raws)
-
-    for i, hi in enumerate(hl_indices):
-        if i + 1 < len(hl_indices):
-            end = hl_indices[i + 1]
-        else:
-            # Multi-ST files: several ST*837* groups share one GS; the first SE in the
-            # file closes only the first transaction. Using se_idx here can make end < hi
-            # and yield an empty slice — use the first SE after this HL instead.
-            end = next(
-                (j for j in range(hi + 1, len(raw_list)) if raw_list[j].startswith("SE")),
-                len(raw_list),
-            )
-        if end < 0:
-            end = len(raw_list)
-        block_raws = raw_list[hi:end]
-        if not block_raws:
-            continue
-        raw_content = t.join(block_raws)
-        parts = block_raws[0].split(base.delimiters.element)  # HL segment
-        hl_id = parts[1].strip() if len(parts) > 1 else ""
-        parent_id = parts[2].strip() if len(parts) > 2 else None
-        if parent_id == "":
-            parent_id = None
-        level_code = parts[3].strip() if len(parts) > 3 else ""
-        claim_id = (
-            _extract_claim_id_from_raw(raw_content, base.delimiters.element, base.delimiters.segment_term)
-            if level_code == "22"
-            else None
-        )
-        full.raw_blocks.append(
-            EdiBlock(
-                hl_id=hl_id,
-                parent_id=parent_id,
-                level_code=level_code,
-                raw_content=raw_content,
-                claim_id=claim_id,
-            )
-        )
-        if claim_id:
-            full._claim_id_to_block_idx[claim_id] = len(full.raw_blocks) - 1
-
-    full.raw_se = raw_list[se_idx] if 0 <= se_idx < len(raw_list) else ""
-    full.raw_ge = raw_list[ge_idx] if 0 <= ge_idx < len(raw_list) else ""
-    full.raw_iea = raw_list[iea_idx] if 0 <= iea_idx < len(raw_list) else ""
     full.raw_segment_list = list(raw_list)
+
+    raw_isa, groups, raw_iea = _build_raw_tree(raw_list, e)
+    full.raw_isa = raw_isa
+    full.raw_iea = raw_iea
+    full.groups = groups
+
+    # Backward-compat flat fields (first occurrence / best effort).
+    if groups:
+        full.raw_gs = groups[0].gs_segment
+        full.raw_ge = groups[0].ge_segment
+        if groups[0].transactions:
+            first_txn = groups[0].transactions[0]
+            full.raw_header = t.join(first_txn.header_segments)
+            full.raw_se = first_txn.se_segment
+
+    for g in groups:
+        for txn in g.transactions:
+            for hl in txn.hl_blocks:
+                claim_segs: list[str] = []
+                for loop in hl.claim_loops:
+                    claim_segs.extend(loop.segments)
+                raw_content = t.join(hl.shared_segments + claim_segs)
+                full.raw_blocks.append(
+                    EdiBlock(
+                        hl_id=hl.hl_id,
+                        parent_id=hl.parent_id,
+                        level_code=hl.level_code,
+                        raw_content=raw_content,
+                        claim_id=hl.claim_ids[0] if hl.claim_ids else None,
+                    )
+                )
 
     return full

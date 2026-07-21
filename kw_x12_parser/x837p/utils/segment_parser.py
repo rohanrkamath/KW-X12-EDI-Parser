@@ -128,7 +128,8 @@ def parse_string(content: str) -> ParsedEDI:
     Raises:
         ValueError: If content doesn't start with ISA or is invalid.
     """
-    content = content.strip()
+    # Tolerate a UTF-8 BOM and surrounding whitespace/newlines before the ISA.
+    content = content.lstrip("\ufeff").strip()
     if not content.startswith("ISA"):
         raise ValueError("EDI content must start with ISA segment")
 
